@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - staging
+      - trying
+
+env:
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  build_and_test:
+    name: Build and test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+
+    steps:
+    - uses: actions/checkout@master
+
+    - uses: ./.github/actions/install-rust
+
+    - name: Install wasmtime
+      uses: bytecodealliance/actions/wasmtime/setup@v1
+
+    - name: check
+      uses: actions-rs/cargo@v1
+      with:
+        command: check
+        args: --all --bins --examples
+
+    - name: wstd tests
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: -p wstd --target wasm32-wasip2 -- --nocapture
+
+    - name: example tests
+      uses: actions-rs/cargo@v1
+      with:
+        command: test
+        args: -p test-programs-artifacts -- --nocapture
+
+
+  check_fmt_and_docs:
+    name: Checking fmt and docs
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - uses: ./.github/actions/install-rust
+
+    - name: fmt
+      run: cargo fmt --all -- --check
+
+    - name: Docs
+      run: cargo doc
+
+    - name: Clippy
+      run: cargo clippy --all
+
+  verify-publish:
+    name: Verify publish
+    if: github.repository_owner == 'bytecodealliance'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+    - uses: ./.github/actions/install-rust
+    - run: rustc ci/publish.rs
+    # Make sure we can bump version numbers for the next release
+    - run: ./publish bump
+    # Make sure the tree is publish-able as-is
+    - run: ./publish verify
+

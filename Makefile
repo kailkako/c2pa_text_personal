@@ -1,0 +1,90 @@
+# Makefile to aid with local development and testing
+# This is not required for automated builds
+
+ifeq ($(OS),Windows_NT)
+	PLATFORM := win
+else
+	UNAME := $(shell uname)
+	ifeq ($(UNAME),Linux)
+		PLATFORM := linux
+	endif
+	ifeq ($(UNAME),Darwin)
+		PLATFORM := mac
+	endif
+endif
+
+# Use cargo-nextest if installed (faster), otherwise fall back to cargo test.
+# Install nextest with: cargo install --locked cargo-nextest
+CARGO_TEST := $(shell cargo nextest --version > /dev/null 2>&1 && echo "cargo nextest run" || echo "cargo test")
+
+# Common feature set used by check-docs, clippy, and test-local so that all
+# three share the same incremental build cache and avoid redundant recompilation.
+FEATURES := file_io,fetch_remote_manifests,add_thumbnails
+
+check-format:
+	cargo +nightly fmt -- --check
+
+check-docs:
+	cargo doc --no-deps --workspace --features="$(FEATURES)"
+
+clippy:
+	cargo clippy --features="$(FEATURES)" --all-targets -- -D warnings
+
+test-local:
+	$(CARGO_TEST) --features="$(FEATURES)" --lib --tests --bins --examples
+
+# Quick SDK-only test pass: unit tests + integration tests, no examples, benches,
+# WASM, or doc checks. Use this during active development for a fast feedback loop.
+test-sdk: check-format check-docs clippy
+	$(CARGO_TEST) -p c2pa --features="$(FEATURES)" --lib --tests
+
+test-wasm:
+	cd sdk && wasm-pack test --node -- --no-default-features --features="rust_native_crypto, fetch_remote_manifests, http_reqwest"
+
+test-wasm-web:
+ifeq ($(PLATFORM),mac)
+	SAFARIDRIVER=$(shell which safaridriver) cargo test -p c2pa --no-default-features --features rust_native_crypto,fetch_remote_manifests,http_reqwest --target wasm32-unknown-unknown
+else
+	cargo test -p c2pa --no-default-features --features rust_native_crypto,fetch_remote_manifests,http_reqwest --target wasm32-unknown-unknown
+endif
+
+# WASI testing requires upstream llvm clang (not XCode), wasmtime, and the target wasm32-wasip2 on the nightly toolchain
+test-wasi:
+ifeq ($(PLATFORM),mac)
+	$(eval CC := /opt/homebrew/opt/llvm/bin/clang)
+endif
+	CC=$(CC) CARGO_TARGET_WASM32_WASIP2_RUNNER="wasmtime -S cli -S http --dir ." cargo +nightly test --target wasm32-wasip2 -p c2pa --no-default-features --features="rust_native_crypto, file_io, fetch_remote_manifests, add_thumbnails, http_wasi, http_wstd"
+	rm -r sdk/Users
+
+# Full local validation, build and test all features including wasm
+# Run this before pushing a PR to pre-validate
+test: check-format check-docs clippy test-local test-wasm
+
+# Auto format code according to standards
+fmt:
+	cargo +nightly fmt
+
+# Builds and views documentation
+doc:
+	cargo doc --no-deps --open
+
+# Builds a set of test images using the make_test_images example
+# Outputs to release/test-images
+images:
+	cargo run --release --bin make_test_images
+
+# Exports JSON schema files so that types can easily be exported to other languages
+# Outputs to release/json-schema
+schema:
+	cargo run --release --bin export_schema
+
+# Runs the client example using test image and output to target/tmp/client.jpg
+client:
+	cargo run --example client sdk/tests/fixtures/ca.jpg target/tmp/client.jpg
+
+# Runs the show example
+show:
+	cargo run --example show -- sdk/tests/fixtures/ca.jpg
+
+release:
+	cd c2pa_c_ffi && make release

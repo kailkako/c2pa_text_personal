@@ -1,0 +1,34 @@
+[package]
+authors = ["Eric Scouten <scouten@adobe.com>"]
+categories = ["parsing"]
+description = "A JUMBF (ISO/IEC 19566-5:2023) parser and builder written in pure Rust."
+documentation = "https://docs.rs/jumbf"
+edition = "2021"
+keywords = ["jumbf"]
+license = "MIT OR Apache-2.0"
+name = "jumbf"
+readme = "README.md"
+repository = "https://github.com/scouten-adobe/jumbf-rs"
+rust-version = "1.88.0"
+version = "0.7.0"
+
+[dependencies]
+thiserror = "2.0.17"
+
+[dev-dependencies]
+hex-literal = "1.1.0"
+pretty_assertions_sorted = "1.2.3"
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "wasi")))'.dev-dependencies]
+codspeed-criterion-compat = "4.3.0"
+
+[[bench]]
+harness = false
+name = "simple_data_box"
+
+[[bench]]
+harness = false
+name = "parse_c2pa"
+
+[package.metadata.cargo-udeps.ignore]
+development = ["criterion"]

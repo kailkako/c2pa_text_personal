@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  RUST_BACKTRACE: full
+
+jobs:
+  rustfmt:
+    name: rustfmt / linux / stable
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        run: |
+          rustup update --no-self-update stable
+          rustup component add rustfmt
+
+      - name: cargo fmt -- --check
+        run: |
+          cargo fmt -- --check
+
+  clippy:
+    name: clippy / linux / stable
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        run: |
+          rustup update --no-self-update stable
+          rustup component add clippy
+
+      - name: cargo clippy
+        run: |
+          cargo clippy --all --examples
+
+  test:
+    name: test / ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - name: linux / stable
+            rust: stable
+          - name: linux / stable --no-default-features
+            rust: stable
+            args: --no-default-features
+          - name: linux / beta
+            rust: beta
+          - name: linux / nightly
+            rust: nightly
+          - name: linux / nightly -Z minimal-versions
+            rust: nightly
+            minimal_versions: true
+          - name: linux / 1.63.0
+            rust: 1.63.0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install rust
+        run: |
+          rustup default ${{ matrix.rust }}
+          rustup update --no-self-update ${{ matrix.rust }}
+
+      - name: Update dependencies for minimal versions
+        if: matrix.minimal_versions
+        run: cargo update -Zminimal-versions
+
+      - name: Test
+        run: |
+          cargo test ${{ matrix.args }}

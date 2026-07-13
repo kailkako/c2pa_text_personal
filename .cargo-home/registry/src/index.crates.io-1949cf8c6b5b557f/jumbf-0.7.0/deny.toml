@@ -1,0 +1,31 @@
+# Configuration used for dependency checking with cargo-deny.
+#
+# For further details on all configuration options see:
+# https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[graph]
+exclude-dev = true
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "wasm32-unknown-unknown" },
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
+confidence-threshold = 0.9
+version = 2
+
+[sources]
+unknown-git = "deny"
+unknown-registry = "deny"

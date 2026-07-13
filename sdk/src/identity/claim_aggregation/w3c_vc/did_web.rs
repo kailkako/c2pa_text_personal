@@ -1,0 +1,417 @@
+// Loosely derived from
+// https://github.com/spruceid/ssi/blob/ssi/v0.9.0/crates/dids/methods/web/src/lib.rs
+// which was published under an Apache 2.0 license.
+
+// Subsequent modifications are subject to license from Adobe
+// as follows:
+
+// Copyright 2024 Adobe. All rights reserved.
+// This file is licensed to you under the Apache License,
+// Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+// or the MIT license (http://opensource.org/licenses/MIT),
+// at your option.
+
+// Unless required by applicable law or agreed to in writing,
+// this software is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR REPRESENTATIONS OF ANY KIND, either express or
+// implied. See the LICENSE-MIT and LICENSE-APACHE files for the
+// specific language governing permissions and limitations under
+// each license.
+
+use std::io::Read;
+
+use super::{did::Did, did_doc::DidDocument};
+use crate::http::{
+    AsyncGenericResolver, AsyncHttpResolver, HttpResolverError, SyncGenericResolver,
+    SyncHttpResolver,
+};
+
+/// Maximum number of bytes accepted from a DID Web server response body.
+pub(crate) const MAX_DID_DOC_SIZE: u64 = 1024 * 1024; // 1 MiB
+
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+#[cfg(test)]
+use std::cell::RefCell;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROXY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+use http::header;
+
+#[derive(Debug, thiserror::Error)]
+pub enum DidWebError {
+    #[error("error building HTTP client: {0}")]
+    Client(HttpResolverError),
+
+    #[error("error sending HTTP request ({0}): {1}")]
+    Request(String, HttpResolverError),
+
+    #[error("server error: {0}")]
+    Server(String),
+
+    #[error("error reading HTTP response: {0}")]
+    Response(HttpResolverError),
+
+    #[error("the document was not found: {0}")]
+    NotFound(String),
+
+    #[error("the document was not a valid DID document: {0}")]
+    InvalidData(String),
+
+    #[error("invalid web DID: {0}")]
+    InvalidWebDid(String),
+
+    #[error("response body exceeded size limit of {MAX_DID_DOC_SIZE} bytes")]
+    ResponseTooLarge,
+}
+
+fn prepare_url(did: &Did<'_>) -> Result<String, DidWebError> {
+    let method = did.method_name();
+    #[allow(clippy::panic)] // TEMPORARY while refactoring
+    if method != "web" {
+        panic!("Unexpected DID method {method}");
+    }
+    to_url(did.method_specific_id())
+}
+
+fn parse_did_doc(bytes: Vec<u8>, url: &str) -> Result<DidDocument, DidWebError> {
+    let json = String::from_utf8(bytes).map_err(|_| DidWebError::InvalidData(url.to_owned()))?;
+    DidDocument::from_json(&json).map_err(|_| DidWebError::InvalidData(url.to_owned()))
+}
+
+pub(crate) async fn resolve_async(did: &Did<'_>) -> Result<DidDocument, DidWebError> {
+    let url = prepare_url(did)?;
+    // TODO: https://w3c-ccg.github.io/did-method-web/#in-transit-security
+    let bytes = get_did_doc(&url).await?;
+    parse_did_doc(bytes, &url)
+}
+
+fn build_request(url: &str) -> Result<http::Request<Vec<u8>>, DidWebError> {
+    http::Request::get(url)
+        .header(header::USER_AGENT, USER_AGENT)
+        .header(header::ACCEPT, "application/did+json")
+        .body(Vec::new())
+        .map_err(|e| DidWebError::Request(url.to_owned(), e.into()))
+}
+
+fn check_response_status(status: http::StatusCode, url: &str) -> Result<(), DidWebError> {
+    match status {
+        http::StatusCode::OK => Ok(()),
+        http::StatusCode::NOT_FOUND => Err(DidWebError::NotFound(url.to_string())),
+        _ => Err(DidWebError::Server(status.to_string())),
+    }
+}
+
+fn read_body_with_limit(body: Box<dyn Read>, url: &str) -> Result<Vec<u8>, DidWebError> {
+    let mut document = Vec::new();
+    body.take(MAX_DID_DOC_SIZE + 1)
+        .read_to_end(&mut document)
+        .map_err(|e| DidWebError::Response(e.into()))?;
+    if document.len() as u64 > MAX_DID_DOC_SIZE {
+        return Err(DidWebError::ResponseTooLarge);
+    }
+    Ok(document)
+}
+
+async fn get_did_doc(url: &str) -> Result<Vec<u8>, DidWebError> {
+    let request = build_request(url)?;
+    let response = AsyncGenericResolver::with_redirects()
+        .unwrap_or_default()
+        .with_max_response_body_size(MAX_DID_DOC_SIZE)
+        .http_resolve_async(request)
+        .await
+        .map_err(|e| match e {
+            HttpResolverError::ResponseTooLarge => DidWebError::ResponseTooLarge,
+            e => DidWebError::Request(url.to_owned(), e),
+        })?;
+    let (parts, body) = response.into_parts();
+    check_response_status(parts.status, url)?;
+    read_body_with_limit(body, url)
+}
+
+pub(crate) fn resolve(did: &Did<'_>) -> Result<DidDocument, DidWebError> {
+    let url = prepare_url(did)?;
+    // TODO: https://w3c-ccg.github.io/did-method-web/#in-transit-security
+    let bytes = get_did_doc_sync(&url)?;
+    parse_did_doc(bytes, &url)
+}
+
+fn get_did_doc_sync(url: &str) -> Result<Vec<u8>, DidWebError> {
+    let request = build_request(url)?;
+    let response = SyncGenericResolver::with_redirects()
+        .unwrap_or_default()
+        .http_resolve(request)
+        .map_err(|e| match e {
+            HttpResolverError::ResponseTooLarge => DidWebError::ResponseTooLarge,
+            e => DidWebError::Request(url.to_owned(), e),
+        })?;
+    let (parts, body) = response.into_parts();
+    check_response_status(parts.status, url)?;
+    read_body_with_limit(body, url)
+}
+
+pub(crate) fn to_url(did: &str) -> Result<String, DidWebError> {
+    let mut parts = did.split(':').peekable();
+    let domain_name = parts
+        .next()
+        .ok_or_else(|| DidWebError::InvalidWebDid(did.to_owned()))?;
+
+    // TODO:
+    // - Validate domain name: alphanumeric, hyphen, dot. no IP address.
+    // - Ensure domain name matches TLS certificate common name
+    // - Support punycode?
+    // - Support query strings?
+    let path = match parts.peek() {
+        Some(_) => parts.collect::<Vec<&str>>().join("/"),
+        None => ".well-known".to_string(),
+    };
+
+    // Use http for localhost, for testing purposes.
+    let proto = if domain_name.starts_with("localhost") {
+        "http"
+    } else {
+        "https"
+    };
+
+    #[allow(unused_mut)]
+    let mut url = format!(
+        "{proto}://{}/{path}/did.json",
+        domain_name.replacen("%3A", ":", 1)
+    );
+
+    #[cfg(test)]
+    PROXY.with(|proxy| {
+        if let Some(ref proxy) = *proxy.borrow() {
+            if domain_name == "localhost" {
+                url = format!("{proxy}{path}/did.json");
+                dbg!(&url);
+            }
+        }
+    });
+
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::panic)]
+    #![allow(clippy::unwrap_used)]
+
+    #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use crate::identity::claim_aggregation::w3c_vc::{did::Did, did_web};
+
+    #[test]
+    #[cfg_attr(
+        all(target_arch = "wasm32", not(target_os = "wasi")),
+        wasm_bindgen_test
+    )]
+    fn to_url() {
+        // https://w3c-ccg.github.io/did-method-web/#example-3-creating-the-did
+        assert_eq!(
+            did_web::to_url(did("did:web:w3c-ccg.github.io").method_specific_id()).unwrap(),
+            "https://w3c-ccg.github.io/.well-known/did.json"
+        );
+        // https://w3c-ccg.github.io/did-method-web/#example-4-creating-the-did-with-optional-path
+        assert_eq!(
+            did_web::to_url(did("did:web:w3c-ccg.github.io:user:alice").method_specific_id())
+                .unwrap(),
+            "https://w3c-ccg.github.io/user/alice/did.json"
+        );
+        // https://w3c-ccg.github.io/did-method-web/#optional-path-considerations
+        assert_eq!(
+            did_web::to_url(did("did:web:example.com:u:bob").method_specific_id()).unwrap(),
+            "https://example.com/u/bob/did.json"
+        );
+        // https://w3c-ccg.github.io/did-method-web/#example-creating-the-did-with-optional-path-and-port
+        assert_eq!(
+            did_web::to_url(did("did:web:example.com%3A443:u:bob").method_specific_id()).unwrap(),
+            "https://example.com:443/u/bob/did.json"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod resolve {
+        use httpmock::prelude::*;
+
+        use super::did;
+        use crate::identity::claim_aggregation::w3c_vc::{
+            did_doc::DidDocument,
+            did_web::{self, DidWebError, MAX_DID_DOC_SIZE, PROXY},
+        };
+
+        #[tokio::test]
+        // #[cfg_attr(all(target_arch = "wasm32", not(target_os = "wasi")),
+        // wasm_bindgen_test)] Can't test this on WASM until we find an httpmock
+        // replacement.
+        async fn from_did_key() {
+            const DID_JSON: &str = r#"{
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": "did:web:localhost",
+            "verificationMethod": [{
+                "id": "did:web:localhost#key1",
+                "type": "Ed25519VerificationKey2018",
+                "controller": "did:web:localhost",
+                "publicKeyBase58": "2sXRz2VfrpySNEL6xmXJWQg6iY94qwNp1qrJJFBuPWmH"
+            }],
+            "assertionMethod": ["did:web:localhost#key1"]
+        }"#;
+
+            let server = MockServer::start();
+
+            PROXY.with(|proxy| {
+                let server_url = server.url("/").replace("127.0.0.1", "localhost");
+                dbg!(&server_url);
+                proxy.replace(Some(server_url));
+            });
+
+            let did_doc_mock = server.mock(|when, then| {
+                when.method(GET).path("/.well-known/did.json");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .body(DID_JSON);
+            });
+
+            let doc = did_web::resolve_async(&did("did:web:localhost"))
+                .await
+                .unwrap();
+            let doc_expected = DidDocument::from_json(DID_JSON).unwrap();
+            assert_eq!(doc, doc_expected);
+
+            PROXY.with(|proxy| {
+                proxy.replace(None);
+            });
+
+            did_doc_mock.assert();
+        }
+
+        #[tokio::test]
+        async fn content_length_above_limit_rejected() {
+            let server = MockServer::start();
+
+            PROXY.with(|proxy| {
+                let server_url = server.url("/").replace("127.0.0.1", "localhost");
+                proxy.replace(Some(server_url));
+            });
+
+            // Server explicitly advertises Content-Length above the limit.
+            // The Content-Length pre-check in AsyncGenericResolver rejects the
+            // response immediately, before passing any body bytes to the caller.
+            let oversized_body = vec![b'X'; (MAX_DID_DOC_SIZE + 1) as usize];
+            let _mock = server.mock(|when, then| {
+                when.method(GET).path("/.well-known/did.json");
+                then.status(200)
+                    .header("content-type", "application/did+json")
+                    .header("content-length", (MAX_DID_DOC_SIZE + 1).to_string())
+                    .body(oversized_body);
+            });
+
+            let result = did_web::resolve_async(&did("did:web:localhost")).await;
+
+            PROXY.with(|proxy| {
+                proxy.replace(None);
+            });
+
+            assert!(
+                matches!(result, Err(did_web::DidWebError::ResponseTooLarge)),
+                "expected ResponseTooLarge, got {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn oversized_response_returns_error() {
+            let server = MockServer::start();
+
+            PROXY.with(|proxy| {
+                let server_url = server.url("/").replace("127.0.0.1", "localhost");
+                proxy.replace(Some(server_url));
+            });
+
+            // Serve a body one byte larger than the allowed limit.
+            let oversized_body = vec![b'X'; (MAX_DID_DOC_SIZE + 1) as usize];
+            let _mock = server.mock(|when, then| {
+                when.method(GET).path("/.well-known/did.json");
+                then.status(200)
+                    .header("content-type", "application/did+json")
+                    .body(oversized_body);
+            });
+
+            let result = did_web::resolve_async(&did("did:web:localhost")).await;
+
+            PROXY.with(|proxy| {
+                proxy.replace(None);
+            });
+
+            assert!(
+                matches!(result, Err(did_web::DidWebError::ResponseTooLarge)),
+                "expected ResponseTooLarge, got {result:?}"
+            );
+        }
+
+        /*
+            #[tokio::test]
+        #[cfg_attr(all(target_arch = "wasm32", not(target_os = "wasi")), wasm_bindgen_test)]
+            async fn credential_prove_verify_did_web() {
+                let didweb = VerificationMethodDIDResolver::new(DIDWeb);
+                let params = VerificationParameters::from_resolver(&didweb);
+
+                let (url, shutdown) = web_server().unwrap();
+                PROXY.with(|proxy| {
+                    proxy.replace(Some(url));
+                });
+
+                let cred = JsonCredential::new(
+                    None,
+                    did!("did:web:localhost").to_owned().into_uri().into(),
+                    "2021-01-26T16:57:27Z".parse().unwrap(),
+                    vec![serde_json::json!({
+                        "id": "did:web:localhost"
+                    })],
+                );
+
+                let key: JWK = include_str!("../../../../../tests/ed25519-2020-10-18.json")
+                    .parse()
+                    .unwrap();
+                let verification_method = iri!("did:web:localhost#key1").to_owned().into();
+                let suite = AnySuite::pick(&key, Some(&verification_method)).unwrap();
+                let issue_options = ProofOptions::new(
+                    "2021-01-26T16:57:27Z".parse().unwrap(),
+                    verification_method,
+                    ProofPurpose::Assertion,
+                    Default::default(),
+                );
+                let signer = SingleSecretSigner::new(key).into_local();
+                let vc = suite
+                    .sign(cred, &didweb, &signer, issue_options)
+                    .await
+                    .unwrap();
+
+                println!(
+                    "proof: {}",
+                    serde_json::to_string_pretty(&vc.proofs).unwrap()
+                );
+                assert_eq!(vc.proofs.first().unwrap().signature.as_ref(), "eyJhbGciOiJFZERTQSIsImNyaXQiOlsiYjY0Il0sImI2NCI6ZmFsc2V9..BCvVb4jz-yVaTeoP24Wz0cOtiHKXCdPcmFQD_pxgsMU6aCAj1AIu3cqHyoViU93nPmzqMLswOAqZUlMyVnmzDw");
+                assert!(vc.verify(&params).await.unwrap().is_ok());
+
+                // test that issuer property is used for verification
+                let mut vc_bad_issuer = vc.clone();
+                vc_bad_issuer.issuer = uri!("did:pkh:example:bad").to_owned().into();
+                // It should fail.
+                assert!(vc_bad_issuer.verify(params).await.unwrap().is_err());
+
+                PROXY.with(|proxy| {
+                    proxy.replace(None);
+                });
+                shutdown().ok();
+            }
+            */
+    }
+
+    fn did(s: &'static str) -> Did<'static> {
+        Did::new(s).unwrap()
+    }
+}
